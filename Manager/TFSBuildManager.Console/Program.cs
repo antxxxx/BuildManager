@@ -14,6 +14,9 @@ namespace TFSBuildManager.Console
     using Microsoft.TeamFoundation.Client;
     using TfsBuildManager.Views;
     using System.Net;
+    using Newtonsoft.Json;
+    using Microsoft.TeamFoundation.Build.Workflow;
+    using Microsoft.TeamFoundation.Build.Workflow.Activities;
 
     public class Program
     {
@@ -58,7 +61,7 @@ namespace TFSBuildManager.Console
                     return action;
                 }
 
-                return "Export";
+                throw new ArgumentNullException("Action");
             }
         }
 
@@ -131,6 +134,20 @@ namespace TFSBuildManager.Console
                 throw new ArgumentNullException("Password");
             }
         }
+
+        internal static string ImportPath
+        {
+            get
+            {
+                string path;
+                if (Arguments.TryGetValue("ImportPath", out path))
+                {
+                    return path;
+                }
+
+                throw new ArgumentNullException("ImportPath");
+            }
+        }
         private static int Main(string[] args)
         {
             Console.WriteLine("Community TFS Build Manager Console - {0}\n", GetFileVersion(Assembly.GetExecutingAssembly()));
@@ -171,7 +188,12 @@ namespace TFSBuildManager.Console
 
                         break;
                     case "IMPORT":
-                        Console.WriteLine("ImportBuildDefinitions is not yet implemented");
+                        retval = ImportBuild(buildServer, ImportPath);
+                        if (retval != 0)
+                        {
+                            return retval;
+                        }
+
                         break;
                     default:
                         rc = ReturnCode.InvalidArgumentsSupplied;
@@ -215,6 +237,194 @@ namespace TFSBuildManager.Console
             
             Console.WriteLine(string.Empty);
             Console.WriteLine("{0} definitions exported to: {1}", defs.Length, ExportPath);
+
+            return 0;
+        }
+
+        private static int ImportBuild(IBuildServer buildServer, string importPath)
+        {
+            try
+            {
+
+                if (!File.Exists(importPath))
+                {
+                    // file does not exist
+                }
+                else
+                {
+                    ExportedBuildDefinition exdef = JsonConvert.DeserializeObject<ExportedBuildDefinition>(File.ReadAllText(importPath));
+                    var newBuildDefinition = buildServer.CreateBuildDefinition(TeamProject);
+                    newBuildDefinition.Name = exdef.Name;
+                    newBuildDefinition.Description = exdef.Description;
+                    newBuildDefinition.ContinuousIntegrationType = exdef.ContinuousIntegrationType;
+                    newBuildDefinition.ContinuousIntegrationQuietPeriod = exdef.ContinuousIntegrationQuietPeriod;
+
+                    newBuildDefinition.QueueStatus = exdef.QueueStatus;
+                    if (exdef.SourceProviders.All(s => s.Name != "TFGIT"))
+                    {
+                        foreach (var mapping in exdef.Mappings)
+                        {
+                            newBuildDefinition.Workspace.AddMapping(mapping.ServerItem, mapping.LocalItem, mapping.MappingType);
+                        }
+                    }
+
+                    newBuildDefinition.RetentionPolicyList.Clear();
+                    foreach (var ret in exdef.RetentionPolicyList)
+                    {
+                        newBuildDefinition.AddRetentionPolicy(ret.BuildReason, ret.BuildStatus, ret.NumberToKeep, ret.DeleteOptions);
+                    }
+
+                    foreach (var sp in exdef.SourceProviders)
+                    {
+                        var provider = newBuildDefinition.CreateInitialSourceProvider(sp.Name);
+                        if (exdef.SourceProviders.All(s => s.Name == "TFGIT"))
+                        {
+                            provider.Fields["RepositoryName"] = sp.Fields["RepositoryName"];
+                            provider.Fields["DefaultBranch"] = sp.Fields["DefaultBranch"];
+                            provider.Fields["CIBranches"] = sp.Fields["CIBranches"];
+                            provider.Fields["RepositoryUrl"] = sp.Fields["RepositoryUrl"];
+                        }
+
+                        newBuildDefinition.SetSourceProvider(provider);
+                    }
+
+                    newBuildDefinition.BuildController = buildServer.GetBuildController(exdef.BuildController);
+                    var x = buildServer.QueryProcessTemplates(TeamProject);
+                    if (x.All(p => p.ServerPath != exdef.ProcessTemplate))
+                    {
+                        // process template not found
+                    }
+
+                    newBuildDefinition.Process = buildServer.QueryProcessTemplates(TeamProject).First(p => p.ServerPath == exdef.ProcessTemplate);
+                    newBuildDefinition.DefaultDropLocation = exdef.DefaultDropLocation;
+                    foreach (var sched in exdef.Schedules)
+                    {
+                        var newSched = newBuildDefinition.AddSchedule();
+                        newSched.DaysToBuild = sched.DaysToBuild;
+                        newSched.StartTime = sched.StartTime;
+                        newSched.TimeZone = sched.TimeZone;
+                    }
+
+                    var process = WorkflowHelpers.DeserializeProcessParameters(newBuildDefinition.ProcessParameters);
+
+                    foreach (var param in exdef.ProcessParameters)
+                    {
+                        if (param.Key != "AgentSettings" && param.Key != "BuildSettings" && param.Key != "TestSpecs")
+                        {
+                            Newtonsoft.Json.Linq.JArray arrayItem = param.Value as Newtonsoft.Json.Linq.JArray;
+                            if (arrayItem == null)
+                            {
+                                Newtonsoft.Json.Linq.JObject objectItem = param.Value as Newtonsoft.Json.Linq.JObject;
+                                if (objectItem == null)
+                                {
+                                    if (param.Key == "CleanWorkspace")
+                                    {
+                                        process.Add(param.Key, (CleanWorkspaceOption)Enum.Parse(typeof(CleanWorkspaceOption), param.Value.ToString()));
+                                    }
+                                    else if (param.Key == "RunCodeAnalysis")
+                                    {
+                                        process.Add(param.Key, (CodeAnalysisOption)Enum.Parse(typeof(CodeAnalysisOption), param.Value.ToString()));
+                                    }
+                                    else
+                                    {
+                                        process.Add(param.Key, param.Value);
+                                    }
+                                }
+                                else
+                                {
+                                    Microsoft.TeamFoundation.Build.Common.BuildParameter paramItem = new Microsoft.TeamFoundation.Build.Common.BuildParameter(param.Value.ToString());
+                                    process.Add(param.Key, paramItem);
+                                }
+                            }
+                            else
+                            {
+                                string[] arrayItemList = new string[arrayItem.Count];
+                                for (int i = 0; i < arrayItem.Count; i++)
+                                {
+                                    arrayItemList[i] = arrayItem[i].ToString();
+                                }
+
+                                process.Add(param.Key, arrayItemList);
+                            }
+                        }
+                    }
+
+                    if (exdef.ProjectsToBuild != null)
+                    {
+                        process.Add("BuildSettings", new BuildSettings { ProjectsToBuild = exdef.ProjectsToBuild, PlatformConfigurations = exdef.ConfigurationsToBuild });
+                    }
+
+                    if (exdef.TfvcAgentSettings != null)
+                    {
+                        process.Add("AgentSettings", new AgentSettings { MaxExecutionTime = exdef.TfvcAgentSettings.MaxExecutionTime, MaxWaitTime = exdef.TfvcAgentSettings.MaxWaitTime, Name = exdef.TfvcAgentSettings.Name, TagComparison = exdef.TfvcAgentSettings.Comparison, Tags = exdef.TfvcAgentSettings.Tags });
+                    }
+                    else if (exdef.GitAgentSettings != null)
+                    {
+                        process.Add("AgentSettings", exdef.GitAgentSettings);
+                    }
+
+                    if (exdef.AgileTestSpecs != null)
+                    {
+                        TestSpecList tsl = new TestSpecList();
+                        foreach (var aitem in exdef.AgileTestSpecs)
+                        {
+                            AgileTestPlatformSpec agileSpec = new AgileTestPlatformSpec();
+                            agileSpec.AssemblyFileSpec = aitem.AssemblyFileSpec;
+                            agileSpec.ExecutionPlatform = aitem.ExecutionPlatform;
+                            agileSpec.FailBuildOnFailure = aitem.FailBuildOnFailure;
+                            agileSpec.RunName = aitem.RunName;
+                            agileSpec.TestCaseFilter = aitem.TestCaseFilter;
+                            agileSpec.RunSettingsForTestRun = new RunSettings();
+                            agileSpec.RunSettingsForTestRun.ServerRunSettingsFile = aitem.RunSettingsFileName;
+                            agileSpec.RunSettingsForTestRun.TypeRunSettings = aitem.TypeRunSettings;
+                            tsl.Add(agileSpec);
+                        }
+
+                        process.Add("TestSpecs", tsl);
+                    }
+
+                    if (exdef.BuildReasons != null)
+                    {
+                        foreach (var key in exdef.BuildReasons.Keys)
+                        {
+                            if (process.ContainsKey(key))
+                            {
+                                process[key] = exdef.BuildReasons[key];
+                            }
+                        }
+                    }
+
+                    if (exdef.IntegerParameters != null)
+                    {
+                        foreach (var key in exdef.IntegerParameters.Keys)
+                        {
+                            if (process.ContainsKey(key))
+                            {
+                                process[key] = exdef.IntegerParameters[key];
+                            }
+                        }
+                    }
+
+                    if (exdef.BuildVerbosities != null)
+                    {
+                        foreach (var key in exdef.BuildVerbosities.Keys)
+                        {
+                            if (process.ContainsKey(key))
+                            {
+                                process[key] = exdef.BuildVerbosities[key];
+                            }
+                        }
+                    }
+
+                    newBuildDefinition.ProcessParameters = WorkflowHelpers.SerializeProcessParameters(process);
+                    newBuildDefinition.Save();
+                }
+            }
+            catch (Exception ex)
+            {
+                // failed
+            }
+
 
             return 0;
         }
@@ -272,6 +482,19 @@ namespace TFSBuildManager.Console
                 Arguments.Add("Password", args.First(item => item.Contains("/Password:")).Replace("/Password:", string.Empty));
             }
 
+            searchTerm = new Regex(@"/ImportPath:.*");
+            propertiesargumentfound = args.Select(arg => searchTerm.Match(arg)).Any(m => m.Success);
+            if (propertiesargumentfound)
+            {
+                Arguments.Add("ImportPath", args.First(item => item.Contains("/ImportPath:")).Replace("/ImportPath:", string.Empty));
+            }
+
+            searchTerm = new Regex(@"/Action:.*");
+            propertiesargumentfound = args.Select(arg => searchTerm.Match(arg)).Any(m => m.Success);
+            if (propertiesargumentfound)
+            {
+                Arguments.Add("Action", args.First(item => item.Contains("/Action:")).Replace("/Action:", string.Empty));
+            }
             Console.Write("...Success\n");
             return 0;
         }
